@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+"""Wallpaper picker for awesome WM: preview images from ~/.config/awesome/wallpaper and apply."""
+
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+from PyQt6.QtCore import QSize, Qt, QThread, pyqtSignal
+from PyQt6.QtGui import QIcon, QKeySequence, QPixmap, QShortcut
+from PyQt6.QtWidgets import (
+    QApplication,
+    QFileDialog,
+    QHBoxLayout,
+    QLabel,
+    QListWidget,
+    QListWidgetItem,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QStatusBar,
+    QVBoxLayout,
+    QWidget,
+)
+
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tiff", ".tif"}
+CONFIG_DIR = Path.home() / ".config" / "awesome"
+WALLPAPER_DIR = CONFIG_DIR / "wallpaper"
+OVERRIDE_FILE = CONFIG_DIR / "wallpaper_override"
+THUMB_SIZE = 160
+
+
+class ThumbnailLoader(QThread):
+    thumbnail_ready = pyqtSignal(str, QPixmap)
+
+    def __init__(self, paths: list[str]):
+        super().__init__()
+        self.paths = paths
+
+    def run(self) -> None:
+        for path in self.paths:
+            pix = QPixmap(path)
+            if pix.isNull():
+                continue
+            thumb = pix.scaled(
+                THUMB_SIZE,
+                THUMB_SIZE,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            self.thumbnail_ready.emit(path, thumb)
+
+
+class WallpaperPicker(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Wallpaper Picker")
+        self.resize(900, 650)
+
+        self.loader: ThumbnailLoader | None = None
+
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
+
+        top_bar = QHBoxLayout()
+        folder_label = QLabel(str(WALLPAPER_DIR))
+        folder_label.setStyleSheet("color: gray;")
+        add_btn = QPushButton("Add Images…")
+        add_btn.clicked.connect(self.add_images)
+        delete_btn = QPushButton("Delete")
+        delete_btn.clicked.connect(self.delete_selected)
+        refresh_btn = QPushButton("Refresh")
+        refresh_btn.clicked.connect(self.refresh_folder)
+        top_bar.addWidget(QLabel("Folder:"))
+        top_bar.addWidget(folder_label, stretch=1)
+        top_bar.addWidget(add_btn)
+        top_bar.addWidget(delete_btn)
+        top_bar.addWidget(refresh_btn)
+        layout.addLayout(top_bar)
+
+        self.list_widget = QListWidget()
+        self.list_widget.setViewMode(QListWidget.ViewMode.IconMode)
+        self.list_widget.setIconSize(QSize(THUMB_SIZE, THUMB_SIZE))
+        self.list_widget.setResizeMode(QListWidget.ResizeMode.Adjust)
+        self.list_widget.setSpacing(10)
+        self.list_widget.setMovement(QListWidget.Movement.Static)
+        self.list_widget.itemDoubleClicked.connect(self.apply_selected)
+        layout.addWidget(self.list_widget, stretch=1)
+
+        QShortcut(QKeySequence(Qt.Key.Key_Delete), self.list_widget).activated.connect(self.delete_selected)
+
+        bottom_bar = QHBoxLayout()
+        self.status_label = QLabel("")
+        apply_btn = QPushButton("Apply Wallpaper")
+        apply_btn.clicked.connect(self.apply_selected)
+        reset_btn = QPushButton("Reset to Theme Default")
+        reset_btn.clicked.connect(self.reset_wallpaper)
+        bottom_bar.addWidget(self.status_label, stretch=1)
+        bottom_bar.addWidget(reset_btn)
+        bottom_bar.addWidget(apply_btn)
+        layout.addLayout(bottom_bar)
+
+        self.setStatusBar(QStatusBar())
+
+        self.refresh_folder()
+
+    def refresh_folder(self) -> None:
+        self.list_widget.clear()
+        WALLPAPER_DIR.mkdir(parents=True, exist_ok=True)
+
+        image_paths = sorted(
+            str(p) for p in WALLPAPER_DIR.iterdir() if p.suffix.lower() in IMAGE_EXTS
+        )
+        if not image_paths:
+            self.statusBar().showMessage(f"No images found in {WALLPAPER_DIR}. Drop some in and hit Refresh.")
+            return
+
+        for path in image_paths:
+            item = QListWidgetItem(Path(path).name)
+            item.setData(Qt.ItemDataRole.UserRole, path)
+            item.setTextAlignment(Qt.AlignmentFlag.AlignHCenter)
+            self.list_widget.addItem(item)
+
+        self.statusBar().showMessage(f"{len(image_paths)} image(s) found. Loading thumbnails…")
+
+        self.loader = ThumbnailLoader(image_paths)
+        self.loader.thumbnail_ready.connect(self.set_thumbnail)
+        self.loader.finished.connect(lambda: self.statusBar().showMessage("Ready.", 3000))
+        self.loader.start()
+
+    def set_thumbnail(self, path: str, pixmap: QPixmap) -> None:
+        for i in range(self.list_widget.count()):
+            item = self.list_widget.item(i)
+            if item.data(Qt.ItemDataRole.UserRole) == path:
+                item.setIcon(QIcon(pixmap))
+                break
+
+    def add_images(self) -> None:
+        name_filter = "Images (*" + " *".join(sorted(IMAGE_EXTS)) + ")"
+        files, _ = QFileDialog.getOpenFileNames(self, "Add Wallpapers", str(Path.home()), name_filter)
+        if not files:
+            return
+
+        WALLPAPER_DIR.mkdir(parents=True, exist_ok=True)
+        added = 0
+        for src in files:
+            src_path = Path(src)
+            dest_path = WALLPAPER_DIR / src_path.name
+            if dest_path.resolve() == src_path.resolve():
+                continue
+            counter = 1
+            while dest_path.exists():
+                dest_path = WALLPAPER_DIR / f"{src_path.stem}_{counter}{src_path.suffix}"
+                counter += 1
+            try:
+                shutil.copy2(src_path, dest_path)
+                added += 1
+            except OSError as exc:
+                QMessageBox.critical(self, "Failed to copy image", f"{src_path.name}: {exc}")
+
+        self.refresh_folder()
+        if added:
+            self.status_label.setText(f"Added {added} image(s).")
+
+    def delete_selected(self) -> None:
+        item = self.list_widget.currentItem()
+        if item is None:
+            QMessageBox.information(self, "No selection", "Select an image first.")
+            return
+
+        path = item.data(Qt.ItemDataRole.UserRole)
+        reply = QMessageBox.question(
+            self,
+            "Delete wallpaper",
+            f"Delete {Path(path).name} from the wallpaper folder?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            Path(path).unlink()
+        except OSError as exc:
+            QMessageBox.critical(self, "Failed to delete image", str(exc))
+            return
+
+        was_active = OVERRIDE_FILE.is_file() and OVERRIDE_FILE.read_text().strip() == path
+        if was_active:
+            self.reset_wallpaper()
+
+        self.refresh_folder()
+        self.status_label.setText(f"Deleted: {Path(path).name}")
+
+    def apply_selected(self) -> None:
+        item = self.list_widget.currentItem()
+        if item is None:
+            QMessageBox.information(self, "No selection", "Select an image first.")
+            return
+
+        path = item.data(Qt.ItemDataRole.UserRole)
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            OVERRIDE_FILE.write_text(path + "\n")
+            subprocess.run(
+                ["awesome-client", "for s in screen do set_wallpaper(s) end"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except (OSError, subprocess.CalledProcessError) as exc:
+            QMessageBox.critical(self, "Failed to apply wallpaper", str(exc))
+            return
+
+        self.status_label.setText(f"Applied: {Path(path).name}")
+
+    def reset_wallpaper(self) -> None:
+        try:
+            OVERRIDE_FILE.unlink(missing_ok=True)
+            subprocess.run(
+                ["awesome-client", "for s in screen do set_wallpaper(s) end"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except (OSError, subprocess.CalledProcessError) as exc:
+            QMessageBox.critical(self, "Failed to reset wallpaper", str(exc))
+            return
+
+        self.status_label.setText("Reset to theme default.")
+
+
+def main() -> None:
+    app = QApplication(sys.argv)
+    window = WallpaperPicker()
+    window.show()
+    sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()
